@@ -516,6 +516,7 @@ class BoardGeometry:
     pads: dict[str, BaseGeometry] = field(default_factory=dict)
     # Outline mirrored with the same transform as the bottom copper (None when not mirrored).
     outline_bottom: Polygon | None = None
+    warnings: list[str] = field(default_factory=list)
 
     def outline_for(self, side: str) -> Polygon:
         if side == "bottom" and self.outline_bottom is not None:
@@ -576,7 +577,9 @@ class BoardGeometry:
         return payload
 
 
-def _outline_from_layers(project: PcbProject) -> tuple[Polygon, float]:
+def _outline_from_layers(
+    project: PcbProject, warnings: list[str] | None = None
+) -> tuple[Polygon, float]:
     outline_layer = project.outline
     if outline_layer is None or outline_layer.geometry is None:
         raise SlicerError("The project has no usable board outline (Edge.Cuts) layer.")
@@ -588,11 +591,26 @@ def _outline_from_layers(project: PcbProject) -> tuple[Polygon, float]:
     exterior_poly = Polygon(shell.exterior)
     perimeter = exterior_poly.exterior.length
     stroke = 0.0
-    if perimeter > 1e-6:
+    # A closed stroked outline is a thin ring (large hole); anything mostly solid
+    # is either a filled region or an open stroke that never closed into a ring.
+    solid = not shell.interiors or shell.area / exterior_poly.area > 0.5
+    if solid:
+        if perimeter > 1e-6 and 2.0 * shell.area / perimeter < 1.0:
+            raise SlicerError(
+                "Board outline (Edge.Cuts) is not a closed contour; "
+                "close the gap in the outline layer."
+            )
+        if warnings is not None:
+            warnings.append(
+                "Board outline is a filled region; using its edge as the board boundary."
+            )
+    elif perimeter > 1e-6:
         stroke = shell.area / perimeter
     stroke = max(0.0, min(stroke, 2.0))
 
-    board = _clean(exterior_poly.buffer(-stroke / 2.0)) or exterior_poly
+    board = exterior_poly
+    if stroke > 0:
+        board = _clean(exterior_poly.buffer(-stroke / 2.0)) or exterior_poly
 
     cutters: list[BaseGeometry] = []
     for polygon in iter_polygons(_clean(outline_layer.geometry)):
@@ -629,7 +647,7 @@ def _outline_from_features(project: PcbProject, margin: float) -> Polygon:
 def build_board(project: PcbProject, config: SlicerConfig) -> BoardGeometry:
     warnings: list[str] = []
     try:
-        outline, _stroke = _outline_from_layers(project)
+        outline, _stroke = _outline_from_layers(project, warnings)
     except SlicerError as exc:
         warnings.append(f"{exc} Falling back to copper extents.")
         outline = _outline_from_features(project, 1.0)
@@ -723,6 +741,7 @@ def build_board(project: PcbProject, config: SlicerConfig) -> BoardGeometry:
         silkscreen=silkscreen,
         pads=pads,
         outline_bottom=bottom_outline if bottom_outline is not machine_outline else None,
+        warnings=warnings,
     )
 
 
@@ -1106,6 +1125,7 @@ def plan_toolpaths(project: PcbProject, config: SlicerConfig) -> ToolpathPlan:
 
     board = build_board(project, config)
     plan = ToolpathPlan(board=board)
+    plan.warnings.extend(board.warnings)
 
     if config.alignment_holes and config.mill_bottom:
         reflected = reflect_about_pin_axis(board.outline, *config.pins())
