@@ -741,7 +741,8 @@ def build_board(project: PcbProject, config: SlicerConfig) -> BoardGeometry:
             )
         )
 
-    bottom_outline = flip(machine_outline, "bottom")
+    # In a bottom-only job the outline is already in the mirrored frame.
+    bottom_outline = machine_outline if bottom_only else flip(machine_outline, "bottom")
 
     return BoardGeometry(
         outline=machine_outline,
